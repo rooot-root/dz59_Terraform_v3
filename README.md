@@ -8,6 +8,19 @@
 
 ## Решение
 
+Созданы ресурсы:
+VPC-сеть `develop` (`yandex_vpc_network.develop`)
+Подсеть `develop` в зоне `ru-central1-a`, CIDR `10.0.1.0/24` (`yandex_vpc_subnet.develop`)
+Группа безопасности `example_dynamic` (`yandex_vpc_security_group.example`) с динамическими блоками `ingress`/`egress`.
+Входящие правила: SSH (22/TCP), HTTP (80/TCP), HTTPS (443/TCP), все `0.0.0.0/0`.
+Исходящее правило: весь исходящий трафик `0.0.0.0/0`, порты 1–65365.
+Секреты и state-файлы исключены через `.gitignore`.
+
+#
+Как назначить группу безопасности ВМ?
+В ресурсе yandex_compute_instance в блоке network_interface используется параметр security_group_ids = [yandex_vpc_security_group.example.id]. 
+Ссылка идёт ресурса (example), а не на отображаемое имя (example_dynamic).
+
 ![Задание 1](./img/zd_1/1.png);
 ![Задание 1](./img/zd_1/2.png);
 
@@ -23,6 +36,12 @@ variable "each_vm" {
 
 ## Решение
 
+count-vm.tf: две одинаковые ВМ web-1 и web-2 через count = 2, имена формируются как web-${count.index + 1}. Привязана группа безопасности example_dynamic.
+for_each-vm.tf: две БД-ВМ main и replica с разными cpu/ram/disk через for_each = { for vm in var.each_vm : vm.vm_name => vm }.
+variables.tf: переменная each_vm типа list(object({ vm_name=string, cpu=number, ram=number, disk_volume=number })). Значения: main cpu=2 ram=2 disk=20; replica cpu=2 ram=2 disk=30.
+depends_on = [yandex_compute_instance.db] — web-ВМ создаются после БД-ВМ.
+locals.tf: ssh_public_key = file("~/.ssh/id_rsa.pub"), ключ используется в metadata обеих ВМ.
+
 ![Задание 2](./img/zd_2/1.png);
 
 
@@ -33,11 +52,42 @@ variable "each_vm" {
 
 ## Решение
 
+Создан disk_vm.tf.
+Созданы 3 одинаковых виртуальных диска по 1 ГБ через yandex_compute_disk с мета-аргументом count = 3:
+storage-disk-1 (id fhmgimpo1vl48699q130)
+storage-disk-2 (id fhmp5e76n4csks5itd4l)
+storage-disk-3 (id fhm8ig7v9hia83dkm20g)
+Создана одиночная ВМ storage (без count/for_each, согласно заданию №4):
+2 vCPU, 2 ГБ RAM
+загрузочный диск 10 ГБ SSD
+публичный IP, SSH-ключ из local.ssh_public_key
+Дополнительные диски подключены к ВМ через dynamic "secondary_disk" + for_each = yandex_compute_disk.storage_disk:
+в конфигурации ВМ видны три блока secondary_disk с ID дисков
+auto_delete = true
+Выполнены terraform init, validate, plan, apply.
+Результат: Apply complete! Resources: 1 added, 0 changed, 0 destroyed. Все три диска подключены к ВМ storage.
+
+
+Почему count даёт web-1 и web-2, а не web-0 и web-1? count.index начинается с 0, поэтому используется count.index + 1.
+Почему for_each не работает напрямую с list? for_each принимает map или set(string). Список преобразуется в map через { for vm in var.each_vm : vm.vm_name => vm }, где ключ — имя ВМ.
+Зачем depends_on? Чтобы гарантировать порядок создания: сначала БД, потом web.
+Почему cpu = 1 не работает? Платформа standard-v1 (Intel Broadwell) поддерживает минимум 2 vCPU. Допустимые значения: 2, 4, 6, 8 и далее. Память при 2 vCPU — минимум 2 ГБ.
+Почему type = network-ssd? Из-за квоты на HDD-диски в зоне ru-central1-a. SSD-квота оказалась свободнее.
+
+#
+Создан disk_vm.tf.
+3 одинаковых диска по 1 ГБ через yandex_compute_disk с count = 3: storage-disk-1, storage-disk-2, storage-disk-3.
+Одиночная ВМ storage без count и for_each: 2 vCPU, 2 ГБ RAM, загрузочный диск 10 ГБ SSD, публичный IP, SSH-ключ.
+Диски подключены через dynamic "secondary_disk" + for_each = yandex_compute_disk.storage_disk. В конфигурации ВМ три блока secondary_disk с ID дисков, auto_delete = true.
+
+Почему for_each в dynamic работает с ресурсом, созданным через count? Terraform позволяет итерироваться по ресурсу с count в dynamic-блоке: for_each = yandex_compute_disk.storage_disk даёт коллекцию из трёх дисков, secondary_disk.value — текущий диск.
+
+Зачем auto_delete = true? Чтобы при удалении ВМ дополнительные диски удалялись автоматически.
 
 
 ![Задание 3](./img/zd_3/1.png);
 ![Задание 3](./img/zd_3/2.png);
-
+![Задание 3](./img/zd_3/3.png);
 
 
 ##Задание 4
@@ -62,5 +112,23 @@ storage ansible_host=<внешний ip-адрес> fqdn=<полное доме�
 
 ## Решение
 
+Создан inventory.tftpl — шаблон Ansible inventory с тремя группами [webservers], [databases], [storage] и динамическими for-циклами.
+
+Создан ansible.tf: locals собирают данные из ресурсов yandex_compute_instance.web, .db, .storage (имя, внешний IP, FQDN), local_file.ansible_inventory рендерит inventory.ini через templatefile.
+
+Inventory динамический: при изменении count или for_each файл автоматически пересобирается. Обрабатывает и 2 ВМ, и 999.
+
+Для каждой ВМ добавлена переменная fqdn.
+
+#
+Откуда берётся fqdn? Из атрибута fqdn ресурса yandex_compute_instance. Если hostname не задан — генерируется автоматически как <id>.auto.internal. Если hostname задан — <hostname>.<region_id>.internal.
+
+Почему inventory динамический? В шаблоне используются %{ for vm in webservers ~} ... %{ endfor ~}. При изменении количества ВМ шаблон автоматически отрендерит нужное число строк.
+
+Почему local_file, а не template_file? template_file — data source (устарел), local_file — ресурс, который создаёт файл на диске. Для генерации inventory это стандартный подход.
 
 ![Задание 4](./img/zd_4/1.png);
+![Задание 4](./img/zd_4/2.png);
+![Задание 4](./img/zd_4/3.png);
+![Задание 4](./img/zd_4/4.png);
+![Задание 4](./img/zd_4/5.png);
